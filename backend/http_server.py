@@ -814,8 +814,16 @@ def api_recycle_list(ctx):
 def api_recycle_restore(ctx):
     body = ctx.json()
     result = ctx.nn.fs.restore(body.get("id", ""), ctx.actor())
+    notes = []
+    if result.get("relocated"):
+        notes.append(f"原位置失效，改道至 {result['path']}")
+    if result.get("renamed"):
+        notes.append(f"同名冲突，更名为 {result['name']}（未覆盖现有条目）")
+    detail = f"恢复条目 {body.get('id')}"
+    if notes:
+        detail += "；" + "；".join(notes)
     ctx.nn.log_event("INFO", "fs", "trash_restore", result["path"],
-                     ctx.actor(), f"恢复条目 {body.get('id')}")
+                     ctx.actor(), detail)
     return {"ok": True, **result}
 
 

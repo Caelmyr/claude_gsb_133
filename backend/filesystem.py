@@ -410,39 +410,135 @@ class VirtualFS:
 
     def recycle_list(self):
         with self.meta.lock:
-            items = list(self._recycle().get("items", {}).values())
+            items = []
+            for it in self._recycle().get("items", {}).values():
+                entry = dict(it)            # 副本：预览信息不写入存储
+                try:
+                    entry["restore_to"] = self.restore_plan(it["id"])
+                except FsError as e:
+                    entry["restore_to"] = {"ok": False, "error": str(e)}
+                items.append(entry)
             items.sort(key=lambda x: x.get("deleted_at", 0), reverse=True)
             return items
 
+    # ---------------------------------------------------- 恢复落点规划
+    def _is_visible(self, inode):
+        """inode 是否在可见目录树内（向上能走到 root，而不是 .trash）。"""
+        inodes = self._inodes()
+        cur, guard = inode, 0
+        while cur and guard < 512:
+            if cur["id"] == self.root_id:
+                return True
+            if cur["id"] == self.trash_id:
+                return False
+            cur = inodes.get(cur.get("parent")) if cur.get("parent") else None
+            guard += 1
+        return False
+
+    def _recycle_item_for_inode(self, inode_id):
+        for it in self._recycle().get("items", {}).values():
+            if it.get("inode") == inode_id:
+                return it
+        return None
+
+    def _nearest_live_parent(self, item):
+        """
+        恢复落点的父目录：原父目录仍有效（存在且可见）则用之；
+        否则沿回收站条目记录的 original_parent 链向上，找最近的可视
+        祖先目录；全部失效（被彻底删除）则回退根目录。
+        返回 (parent_inode, relocated)——relocated=True 表示未能回到原位置。
+        """
+        inodes = self._inodes()
+        pid = item.get("original_parent")
+        node = inodes.get(pid)
+        if node and node["type"] == "dir" and self._is_visible(node):
+            return node, False
+        seen = {pid}
+        while pid and pid not in (self.root_id, self.trash_id):
+            rec_item = self._recycle_item_for_inode(pid)
+            if not rec_item:
+                break
+            pid = rec_item.get("original_parent")
+            if pid in seen:
+                break
+            seen.add(pid)
+            node = inodes.get(pid)
+            if node and node["type"] == "dir" and self._is_visible(node):
+                return node, True
+        return inodes.get(self.root_id), True
+
+    def _nested_trash_items(self, item):
+        """
+        回收站中原路径位于该目录条目之内的其它条目。
+        这些子孙是在父目录删除前被单独删除的——删除时已从父目录摘出，
+        所以按原路径前缀判定，而不是看当前子树（当前子树里早已没有它们）。
+        """
+        if item.get("type") != "dir":
+            return []
+        prefix = (item.get("original_path") or "").rstrip("/") + "/"
+        if not prefix.strip("/"):
+            return []
+        return [it["id"] for it in self._recycle().get("items", {}).values()
+                if it["id"] != item.get("id")
+                and (it.get("original_path") or "").startswith(prefix)]
+
+    def restore_plan(self, item_id):
+        """
+        纯计算恢复计划（不落盘、不改状态），供预览与 restore 共用：
+          * parent_path 落点父目录（原位置失效时取最近可视祖先，兜底根目录）
+          * name        最终名称——目标处同名冲突时追加 (restored-N)，绝不覆盖
+          * relocated   原父目录已删除/也在回收站，落点被迫变更
+          * renamed     因同名冲突被改名
+          * nested      回收站内属于其子孙的条目 id（恢复目录不会带出它们）
+        """
+        rec = self._recycle()
+        item = rec.get("items", {}).get(item_id)
+        if not item:
+            raise FsError("回收站条目不存在")
+        inode = self._inodes().get(item["inode"])
+        if not inode:
+            raise FsError("inode 已丢失，无法恢复")
+        parent, relocated = self._nearest_live_parent(item)
+        base = inode.get("_orig_name") or item.get("name") or inode["name"]
+        name, n = base, 1
+        while self._child_by_name(parent, name):
+            stem, dot, ext = base.rpartition(".")
+            if dot and stem:
+                name = f"{stem} (restored-{n}).{ext}"
+            else:
+                name = f"{base} (restored-{n})"
+            n += 1
+        parent_path = self.path_of(parent["id"])
+        return {
+            "ok": True,
+            "parent_id": parent["id"],
+            "parent_path": parent_path,
+            "path": join_path(parent_path, name),
+            "name": name,
+            "original_path": item.get("original_path"),
+            "relocated": relocated,
+            "renamed": name != base,
+            "nested": self._nested_trash_items(item),
+        }
+
     def restore(self, item_id, actor="admin"):
+        """
+        恢复 = 挂回可见目录树（保证结果一定在树内，绝不挂进 .trash 子树）。
+        落点规则与 restore_plan 一致；返回实际落点、是否改道、是否改名，
+        调用方应如实展示给用户。
+        """
         with self.meta.lock:
             rec = self._recycle()
             item = rec.get("items", {}).get(item_id)
             if not item:
                 raise FsError("回收站条目不存在")
+            plan = self.restore_plan(item_id)
             inode = self._inodes().get(item["inode"])
-            if not inode:
-                raise FsError("inode 已丢失，无法恢复")
             trash = self._inodes().get(self.trash_id)
             if inode["id"] in trash.get("children", []):
                 trash["children"].remove(inode["id"])
-
-            # 恢复原路径：父目录不存在则恢复到根
-            parent = self._inodes().get(item.get("original_parent"))
-            if not parent or parent["type"] != "dir":
-                parent = self._inodes().get(self.root_id)
-            name = inode.get("_orig_name") or inode["name"]
-            # 同名冲突 => "name (restored-N)"
-            base_name = name
-            n = 1
-            while self._child_by_name(parent, name):
-                stem, dot, ext = base_name.rpartition(".")
-                if dot and stem:
-                    name = f"{stem} (restored-{n}).{ext}"
-                else:
-                    name = f"{base_name} (restored-{n})"
-                n += 1
-            inode["name"] = name
+            parent = self._inodes().get(plan["parent_id"])
+            inode["name"] = plan["name"]
             inode.pop("_orig_name", None)
             inode["parent"] = parent["id"]
             parent["children"].append(inode["id"])
@@ -450,7 +546,9 @@ class VirtualFS:
             del rec["items"][item_id]
             self.meta.touch("fs")
             self.meta.touch("recycle")
-            return {"path": self.path_of(inode["id"]), "name": name}
+            return {k: plan[k] for k in
+                    ("path", "name", "parent_path", "original_path",
+                     "relocated", "renamed", "nested")}
 
     def purge(self, item_id, actor="admin"):
         """彻底删除：递归移除 inode，返回释放的 block_ids（GC 兜底）。"""
