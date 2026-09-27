@@ -414,35 +414,83 @@ class VirtualFS:
             items.sort(key=lambda x: x.get("deleted_at", 0), reverse=True)
             return items
 
-    def restore(self, item_id, actor="admin"):
+    def _is_live_dir(self, node):
+        """目录 inode 是否仍挂在活动目录树上（root 可达、不在 .trash 子树内）。
+
+        沿 parent 链向上走：能到达 root 才是有效落点；途经 .trash、
+        父链断裂或成环（guard 兜底）都视为失效。
+        """
+        if not node or node.get("type") != "dir":
+            return False
+        inodes = self._inodes()
+        cur = node
+        guard = 0
+        while cur and guard < 512:
+            if cur["id"] == self.trash_id:
+                return False
+            if cur["id"] == self.root_id:
+                return True
+            cur = inodes.get(cur.get("parent")) if cur.get("parent") else None
+            guard += 1
+        return False
+
+    def _restore_plan(self, item):
+        """计算恢复落点（纯查询，不改动任何状态），供预览与正式恢复共用。
+
+        返回 dict：inode/parent/最终 name/base_name/renamed/fallback/target_dir。
+        """
+        inodes = self._inodes()
+        inode = inodes.get(item["inode"])
+        if not inode:
+            raise FsError("inode 已丢失，无法恢复")
+        base_name = (inode.get("_orig_name") or item.get("name")
+                     or inode["name"])
+        # 原父目录必须仍挂在活动目录树上才可用，否则回退到根目录——
+        # 父目录可能也被删进了回收站，恢复过去会让条目两头不可见
+        parent = inodes.get(item.get("original_parent"))
+        fallback = not self._is_live_dir(parent)
+        if fallback:
+            parent = inodes.get(self.root_id)
+        # 同名冲突 => "name (restored-N)"（只改名，绝不覆盖既有条目）
+        name = base_name
+        n = 1
+        while self._child_by_name(parent, name):
+            stem, dot, ext = base_name.rpartition(".")
+            if dot and stem:
+                name = f"{stem} (restored-{n}).{ext}"
+            else:
+                name = f"{base_name} (restored-{n})"
+            n += 1
+        return {
+            "inode": inode, "parent": parent, "name": name,
+            "base_name": base_name, "renamed": name != base_name,
+            "fallback": fallback,
+            "target_dir": self.path_of(parent["id"]),
+        }
+
+    def restore(self, item_id, actor="admin", dry_run=False):
+        """恢复回收站条目。dry_run=True 时只返回落点预览，不改动任何状态。"""
         with self.meta.lock:
             rec = self._recycle()
             item = rec.get("items", {}).get(item_id)
             if not item:
                 raise FsError("回收站条目不存在")
-            inode = self._inodes().get(item["inode"])
-            if not inode:
-                raise FsError("inode 已丢失，无法恢复")
+            plan = self._restore_plan(item)
+            result = {
+                "path": join_path(plan["target_dir"], plan["name"]),
+                "name": plan["name"],
+                "original_name": plan["base_name"],
+                "renamed": plan["renamed"],
+                "fallback": plan["fallback"],
+                "target_dir": plan["target_dir"],
+            }
+            if dry_run:
+                return result
+            inode, parent = plan["inode"], plan["parent"]
             trash = self._inodes().get(self.trash_id)
             if inode["id"] in trash.get("children", []):
                 trash["children"].remove(inode["id"])
-
-            # 恢复原路径：父目录不存在则恢复到根
-            parent = self._inodes().get(item.get("original_parent"))
-            if not parent or parent["type"] != "dir":
-                parent = self._inodes().get(self.root_id)
-            name = inode.get("_orig_name") or inode["name"]
-            # 同名冲突 => "name (restored-N)"
-            base_name = name
-            n = 1
-            while self._child_by_name(parent, name):
-                stem, dot, ext = base_name.rpartition(".")
-                if dot and stem:
-                    name = f"{stem} (restored-{n}).{ext}"
-                else:
-                    name = f"{base_name} (restored-{n})"
-                n += 1
-            inode["name"] = name
+            inode["name"] = plan["name"]
             inode.pop("_orig_name", None)
             inode["parent"] = parent["id"]
             parent["children"].append(inode["id"])
@@ -450,23 +498,47 @@ class VirtualFS:
             del rec["items"][item_id]
             self.meta.touch("fs")
             self.meta.touch("recycle")
-            return {"path": self.path_of(inode["id"]), "name": name}
+            return result
 
     def purge(self, item_id, actor="admin"):
-        """彻底删除：递归移除 inode，返回释放的 block_ids（GC 兜底）。"""
+        """彻底删除：递归移除 inode，返回释放的 block_ids（GC 兜底）。
+
+        子树中若挂着其他回收站条目指向的 inode（历史遗留的嵌套状态），
+        那些条目随本次删除永久失效——一并注销，避免回收站列表留下
+        指向已销毁 inode 的幽灵条目。
+        """
         with self.meta.lock:
             rec = self._recycle()
             item = rec.get("items", {}).get(item_id)
             if not item:
                 raise FsError("回收站条目不存在")
+            doomed = self._subtree_ids(item["inode"])
+            cascaded = [iid for iid, it in rec.get("items", {}).items()
+                        if iid != item_id and it.get("inode") in doomed]
             freed = self._remove_subtree(item["inode"])
             trash = self._inodes().get(self.trash_id)
             if item["inode"] in trash.get("children", []):
                 trash["children"].remove(item["inode"])
             del rec["items"][item_id]
+            for iid in cascaded:
+                rec["items"].pop(iid, None)
             self.meta.touch("fs")
             self.meta.touch("recycle")
-            return freed
+            return {"freed": freed, "cascaded": cascaded}
+
+    def _subtree_ids(self, inode_id):
+        """子树全部 inode id 集合（含自身）。"""
+        inodes = self._inodes()
+        ids = set()
+        stack = [inode_id]
+        while stack:
+            cur = stack.pop()
+            node = inodes.get(cur)
+            if not node or cur in ids:
+                continue
+            ids.add(cur)
+            stack.extend(node.get("children", []))
+        return ids
 
     def _remove_subtree(self, inode_id):
         inodes = self._inodes()
@@ -488,7 +560,10 @@ class VirtualFS:
             freed = []
             count = 0
             for item_id in list(rec.get("items", {}).keys()):
-                freed.extend(self.purge(item_id, actor))
+                # 级联注销可能已删掉后续条目，逐项确认仍存在
+                if item_id not in rec.get("items", {}):
+                    continue
+                freed.extend(self.purge(item_id, actor)["freed"])
                 count += 1
             return {"purged": count, "freed_blocks": freed}
 
@@ -500,9 +575,13 @@ class VirtualFS:
             expired = [iid for iid, it in rec.get("items", {}).items()
                        if it.get("expires_at", 0) < t]
             freed = []
+            purged = []
             for iid in expired:
-                freed.extend(self.purge(iid, "system"))
-            return expired, freed
+                if iid not in rec.get("items", {}):
+                    continue   # 已被前一次 purge 的级联注销
+                freed.extend(self.purge(iid, "system")["freed"])
+                purged.append(iid)
+            return purged, freed
 
     def trash_stats(self):
         with self.meta.lock:

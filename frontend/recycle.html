@@ -47,7 +47,8 @@
         <div class="card-title">机制说明</div>
         <div class="small dim" style="line-height:1.9">
           · <b>删除 = 移动</b>：条目从原目录摘出，挂到隐藏的 <span class="mono">.trash</span> 子树下，数据块保持完整；<br>
-          · <b>恢复</b>：放回原路径（父目录已删除则回到根目录；同名冲突自动追加 <span class="mono">(restored-N)</span> 后缀）；<br>
+          · <b>恢复</b>：放回原路径，恢复前弹窗预览落点；原父目录已失效（不存在或也在回收站）则回退到根目录；
+            同名冲突自动追加 <span class="mono">(restored-N)</span> 后缀（只改名，不覆盖），落点与改名均会在结果中明示；<br>
           · <b>彻底删除</b>：递归移除 inode 并释放块引用——块本体不会立即消失，
             由 NameNode 的 GC 线程确认「无活动文件 + 无历史提交引用」后，
             经宽限期向各 DataNode 下发删除命令；<br>
@@ -128,9 +129,34 @@ function renderItems(items) {
     </tr>`).join("");
   body.querySelectorAll(".it-restore").forEach(b => b.onclick = async () => {
     try {
-      const r = await api("POST", "/api/recycle/restore", { id: b.dataset.id });
-      toast(`已恢复到 ${r.path}`, "ok");
-      load();
+      // 先取落点预览（dry_run，不改动任何状态），确认后再正式恢复
+      const p = await api("POST", "/api/recycle/restore",
+        { id: b.dataset.id, dry_run: true });
+      const warns = [];
+      if (p.fallback) warns.push(
+        `<div class="badge warn plain">原父目录已失效（可能也在回收站），将回退到根目录</div>`);
+      if (p.renamed) warns.push(
+        `<div class="badge warn plain">目标位置已有同名条目，将改名为
+         <span class="mono">${esc(p.name)}</span>（不会覆盖）</div>`);
+      DFSVS.modal({
+        title: `恢复「${b.dataset.n}」`,
+        body: `<div style="font-size:13.5px;line-height:2">
+          落点预览：<span class="mono">${esc(p.path)}</span>
+          <div style="margin-top:6px;display:flex;flex-direction:column;gap:4px">
+            ${warns.join("")}
+          </div></div>`,
+        okText: "确认恢复",
+        onOk: async () => {
+          try {
+            const r = await api("POST", "/api/recycle/restore", { id: b.dataset.id });
+            const notes = [];
+            if (r.fallback) notes.push("原父目录已失效，已回退到根目录");
+            if (r.renamed) notes.push(`同名冲突，已改名为 ${r.name}`);
+            toast(`已恢复到 ${r.path}` + (notes.length ? `（${notes.join("；")}）` : ""), "ok");
+            load();
+          } catch (e) { toast("恢复失败：" + e.message, "bad"); }
+        },
+      });
     } catch (e) { toast("恢复失败：" + e.message, "bad"); }
   });
   body.querySelectorAll(".it-purge").forEach(b => b.onclick = () =>
@@ -138,7 +164,8 @@ function renderItems(items) {
       async () => {
         try {
           const r = await api("POST", "/api/recycle/purge", { id: b.dataset.id });
-          toast(`已彻底删除（释放 ${r.freed_blocks} 个块引用）`, "ok");
+          toast(`已彻底删除（释放 ${r.freed_blocks} 个块引用）` +
+            (r.cascaded ? `，级联注销 ${r.cascaded} 个失效条目` : ""), "ok");
           load();
         } catch (e) { toast(e.message, "bad"); }
       }, true));

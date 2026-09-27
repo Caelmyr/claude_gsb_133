@@ -813,19 +813,34 @@ def api_recycle_list(ctx):
 @route("POST", "/api/recycle/restore")
 def api_recycle_restore(ctx):
     body = ctx.json()
-    result = ctx.nn.fs.restore(body.get("id", ""), ctx.actor())
+    dry_run = bool(body.get("dry_run"))
+    result = ctx.nn.fs.restore(body.get("id", ""), ctx.actor(),
+                               dry_run=dry_run)
+    if dry_run:
+        return {"ok": True, "dry_run": True, **result}
+    notes = []
+    if result["fallback"]:
+        notes.append("原父目录已失效，回退到根目录")
+    if result["renamed"]:
+        notes.append(f"同名冲突，已改名为 {result['name']}")
     ctx.nn.log_event("INFO", "fs", "trash_restore", result["path"],
-                     ctx.actor(), f"恢复条目 {body.get('id')}")
+                     ctx.actor(),
+                     f"恢复条目 {body.get('id')} -> {result['path']}"
+                     + (f"（{'；'.join(notes)}）" if notes else ""))
     return {"ok": True, **result}
 
 
 @route("POST", "/api/recycle/purge")
 def api_recycle_purge(ctx):
     body = ctx.json()
-    freed = ctx.nn.fs.purge(body.get("id", ""), ctx.actor())
+    result = ctx.nn.fs.purge(body.get("id", ""), ctx.actor())
+    detail = f"彻底删除，释放 {len(result['freed'])} 个块引用（GC 回收）"
+    if result["cascaded"]:
+        detail += f"；级联注销 {len(result['cascaded'])} 个失效条目"
     ctx.nn.log_event("WARN", "fs", "trash_purge", body.get("id", ""),
-                     ctx.actor(), f"彻底删除，释放 {len(freed)} 个块引用（GC 回收）")
-    return {"ok": True, "freed_blocks": len(freed)}
+                     ctx.actor(), detail)
+    return {"ok": True, "freed_blocks": len(result["freed"]),
+            "cascaded": len(result["cascaded"])}
 
 
 @route("POST", "/api/recycle/empty")
